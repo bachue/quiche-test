@@ -1,3 +1,4 @@
+use anyhow::bail;
 use log::{debug, error, info, warn};
 use quiche::{
     h3::{self, NameValue},
@@ -10,15 +11,18 @@ use ring::{
 use std::{
     collections::HashMap,
     fs::read,
-    io::ErrorKind as IOErrorKind,
+    io::{ErrorKind as IOErrorKind, Read},
     net::{IpAddr, SocketAddr},
     path::{Component, Path, PathBuf},
     pin::Pin,
+    sync::{
+        atomic::{AtomicUsize, Ordering::Relaxed},
+        Arc,
+    },
 };
 use tap::prelude::*;
 
-const MAX_DATAGRAM_SIZE: usize = 1350;
-const ONE_GB: u64 = 1 << 30;
+use crate::{MAX_DATAGRAM_SIZE, ONE_GB};
 
 struct PartialRequest {
     headers: Vec<h3::Header>,
@@ -40,59 +44,82 @@ struct Client {
 
 type ClientMap = HashMap<ConnectionId<'static>, (SocketAddr, Client)>;
 
-pub(super) fn start_server(socket: mio::net::UdpSocket) {
-    start_server_inner(socket).expect("Failed to start http server");
+const SERVER_TOKEN: mio::Token = mio::Token(0);
+const RECEIVER_TOKEN: mio::Token = mio::Token(1);
+static CLIENTS_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
-    fn start_server_inner(mut socket: mio::net::UdpSocket) -> anyhow::Result<()> {
-        let mut events = mio::Events::with_capacity(1024);
+pub(super) fn start_server(
+    socket: mio::net::UdpSocket,
+    tasks_number: Arc<AtomicUsize>,
+    receiver: mio::unix::pipe::Receiver,
+) {
+    start_server_inner(socket, tasks_number, receiver).expect("Failed to start http server");
 
+    fn start_server_inner(
+        mut socket: mio::net::UdpSocket,
+        tasks_number: Arc<AtomicUsize>,
+        mut receiver: mio::unix::pipe::Receiver,
+    ) -> anyhow::Result<()> {
         let mut poll = mio::Poll::new().unwrap();
         poll.registry()
-            .register(&mut socket, mio::Token(0), mio::Interest::READABLE)?;
+            .register(&mut socket, SERVER_TOKEN, mio::Interest::READABLE)?;
+        poll.registry()
+            .register(&mut receiver, RECEIVER_TOKEN, mio::Interest::READABLE)?;
 
-        let mut config = make_quiche_config()?;
-        let h3_config = h3::Config::new()?;
-
-        let conn_id_seed = Key::generate(HMAC_SHA256, &SystemRandom::new()).unwrap();
-        let mut clients = ClientMap::new();
-
-        events_loop(
-            &mut clients,
-            &mut events,
-            &mut poll,
-            &mut socket,
-            &conn_id_seed,
-            &mut config,
-            &h3_config,
-        )?;
+        events_loop(&mut poll, &mut socket, tasks_number, &mut receiver)?;
 
         Ok(())
     }
 }
 
 fn events_loop(
-    clients: &mut ClientMap,
-    events: &mut mio::Events,
     poll: &mut mio::Poll,
     socket: &mut mio::net::UdpSocket,
-    conn_id_seed: &Key,
-    config: &mut quiche::Config,
-    h3_config: &h3::Config,
+    tasks_number: Arc<AtomicUsize>,
+    receiver: &mut mio::unix::pipe::Receiver,
 ) -> anyhow::Result<()> {
+    let mut events = mio::Events::with_capacity(1024);
     let mut buf = [0; 65535];
     let mut out = [0; MAX_DATAGRAM_SIZE];
+    let mut config = make_quiche_config()?;
+    let h3_config = h3::Config::new()?;
+    let conn_id_seed = Key::generate(HMAC_SHA256, &SystemRandom::new()).unwrap();
+    let mut clients = ClientMap::new();
 
-    loop {
+    'events: while tasks_number.load(Relaxed) > 0 {
         let timeout = clients.values().filter_map(|(_, c)| c.conn.timeout()).min();
 
-        poll.poll(events, timeout)?;
+        poll.poll(&mut events, timeout)?;
 
         'read: loop {
+            if tasks_number.load(Relaxed) == 0 {
+                break 'events;
+            }
+
             if events.is_empty() {
                 warn!("timed out");
 
                 clients.values_mut().for_each(|(_, c)| c.conn.on_timeout());
 
+                break 'read;
+            }
+
+            if events
+                .iter()
+                .find(|event| event.token() == RECEIVER_TOKEN)
+                .is_some()
+            {
+                let mut buf = Vec::with_capacity(4);
+                receiver.read_to_end(&mut buf).ok();
+                if tasks_number.load(Relaxed) == 0 {
+                    break 'events;
+                }
+            }
+            if events
+                .iter()
+                .find(|event| event.token() == SERVER_TOKEN)
+                .is_none()
+            {
                 break 'read;
             }
 
@@ -106,7 +133,7 @@ fn events_loop(
                         break 'read;
                     }
 
-                    panic!("recv() failed: {:?}", e);
+                    bail!("recv() failed: {:?}", e);
                 }
             };
             debug!("got {} bytes", len);
@@ -122,9 +149,11 @@ fn events_loop(
 
             debug!("got packet {:?}", hdr);
 
-            let conn_id = hmac::sign(&conn_id_seed, &hdr.dcid);
-            let conn_id = &conn_id.as_ref()[..MAX_CONN_ID_LEN];
-            let conn_id = conn_id.to_vec().into();
+            let conn_id = {
+                let conn_id = hmac::sign(&conn_id_seed, &hdr.dcid);
+                let conn_id = &conn_id.as_ref()[..MAX_CONN_ID_LEN];
+                conn_id.to_vec().into()
+            };
 
             let (_, client) = if clients.contains_key(&hdr.dcid) || clients.contains_key(&conn_id) {
                 match clients.get_mut(&hdr.dcid) {
@@ -147,7 +176,7 @@ fn events_loop(
                             debug!("send() would block");
                             break;
                         }
-                        panic!("send() failed: {:?}", e);
+                        bail!("send() failed: {:?}", e);
                     }
                     continue 'read;
                 }
@@ -175,7 +204,7 @@ fn events_loop(
                             break;
                         }
 
-                        panic!("send() failed: {:?}", e);
+                        bail!("send() failed: {:?}", e);
                     }
                     continue 'read;
                 }
@@ -195,7 +224,7 @@ fn events_loop(
 
                 debug!("New connection: dcid={:?} scid={:?}", hdr.dcid, scid);
 
-                let conn = quiche::accept(&scid, odcid.as_ref(), config)?;
+                let conn = quiche::accept(&scid, odcid.as_ref(), &mut config)?;
 
                 let client = Client {
                     conn,
@@ -204,7 +233,9 @@ fn events_loop(
                     partial_responses: Default::default(),
                 };
 
-                clients.insert(scid.to_owned(), (src, client));
+                if clients.insert(scid.to_owned(), (src, client)).is_none() {
+                    CLIENTS_COUNTER.fetch_add(1, Relaxed);
+                }
                 clients.get_mut(&scid).unwrap()
             };
 
@@ -319,7 +350,7 @@ fn events_loop(
         }
         for (peer, client) in clients.values_mut() {
             loop {
-                let write = match client.conn.send(&mut out) {
+                let written = match client.conn.send(&mut out) {
                     Ok(v) => v,
 
                     Err(quiche::Error::Done) => {
@@ -335,16 +366,16 @@ fn events_loop(
                     }
                 };
 
-                if let Err(e) = socket.send_to(&out[..write], *peer) {
+                if let Err(e) = socket.send_to(&out[..written], *peer) {
                     if e.kind() == IOErrorKind::WouldBlock {
                         debug!("send() would block");
                         break;
                     }
 
-                    panic!("send() failed: {:?}", e);
+                    bail!("send() failed: {:?}", e);
                 }
 
-                debug!("{} written {} bytes", client.conn.trace_id(), write);
+                debug!("{} written {} bytes", client.conn.trace_id(), written);
             }
         }
 
@@ -363,6 +394,9 @@ fn events_loop(
             }
         });
     }
+
+    info!("Clients count: {}", CLIENTS_COUNTER.load(Relaxed));
+    Ok(())
 }
 
 const TOKEN_PREFIX: &[u8] = b"quiche";
