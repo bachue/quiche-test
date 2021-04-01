@@ -11,8 +11,9 @@ use log::{debug, error, info};
 use quiche::h3;
 use rayon::ThreadPoolBuilder;
 use ring::rand::{SecureRandom, SystemRandom};
-const TASK_COUNT: usize = 10000;
+const TASK_COUNT: usize = 100;
 const WORKER_COUNT: usize = 10;
+const REQ_CNT_FOR_EACH_TASK: usize = 100;
 
 pub(super) fn new_tasks_number() -> Arc<AtomicUsize> {
     return Arc::new(AtomicUsize::new(TASK_COUNT));
@@ -49,8 +50,10 @@ pub(super) fn start_clients(
                     let sender = sender.to_owned();
                     s.spawn(move |_| {
                         let _tasks_number_guard = TasksNumberGuard::new(tasks_number, sender);
-                        start_client_worker(bind_addr, server_address)
-                            .expect("Client worker failed")
+                        for _ in 0..REQ_CNT_FOR_EACH_TASK {
+                            start_client_worker(bind_addr, server_address)
+                                .expect("Client worker failed")
+                        }
                     });
                 }
             });
