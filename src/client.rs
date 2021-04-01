@@ -11,9 +11,9 @@ use log::{debug, error, info};
 use quiche::h3;
 use rayon::ThreadPoolBuilder;
 use ring::rand::{SecureRandom, SystemRandom};
-const TASK_COUNT: usize = 100;
+const TASK_COUNT: usize = 10;
 const WORKER_COUNT: usize = 10;
-const REQ_CNT_FOR_EACH_TASK: usize = 100;
+const REQ_CNT_FOR_EACH_TASK: usize = 10;
 
 pub(super) fn new_tasks_number() -> Arc<AtomicUsize> {
     return Arc::new(AtomicUsize::new(TASK_COUNT));
@@ -64,6 +64,7 @@ pub(super) fn start_clients(
 fn start_client_worker(bind_addr: SocketAddr, server_address: SocketAddr) -> anyhow::Result<()> {
     let mut socket = mio::net::UdpSocket::bind(bind_addr)?;
     socket.connect(server_address)?;
+    let random = SystemRandom::new();
 
     let mut poll = mio::Poll::new().unwrap();
     poll.registry()
@@ -72,7 +73,7 @@ fn start_client_worker(bind_addr: SocketAddr, server_address: SocketAddr) -> any
     let mut config = make_quiche_config().unwrap();
     let mut http3_conn = None;
     let mut scid = [0; quiche::MAX_CONN_ID_LEN];
-    SystemRandom::new().fill(&mut scid[..]).unwrap();
+    random.fill(&mut scid[..]).unwrap();
     let scid = quiche::ConnectionId::from_ref(&scid);
     let mut conn = quiche::connect(Some("localhost"), &scid, &mut config).unwrap();
     info!(
@@ -98,10 +99,10 @@ fn start_client_worker(bind_addr: SocketAddr, server_address: SocketAddr) -> any
 
     let h3_config = quiche::h3::Config::new().unwrap();
     let request_headers = vec![
-        h3::Header::new(":method", "GET"),
+        h3::Header::new(":method", "POST"),
         h3::Header::new(":scheme", "https"),
         h3::Header::new(":authority", "localhost"),
-        h3::Header::new(":path", "/services"),
+        h3::Header::new(":path", "/"),
         h3::Header::new("user-agent", "quiche"),
     ];
     let request_begin_at = Instant::now();
@@ -160,9 +161,20 @@ fn start_client_worker(bind_addr: SocketAddr, server_address: SocketAddr) -> any
             if !request_sent {
                 info!("sending HTTP request {:?}", request_headers);
 
-                http3_conn
-                    .send_request(&mut conn, &request_headers, true)
+                let stream_id = http3_conn
+                    .send_request(&mut conn, &request_headers, false)
                     .unwrap();
+
+                let mut body = vec![0u8; 4194304];
+                random.fill(&mut body).unwrap();
+                let mut have_written = 0;
+                while have_written < body.len() {
+                    let written = http3_conn
+                        .send_body(&mut conn, stream_id, &body[have_written..], true)
+                        .unwrap();
+                    have_written += written;
+                }
+
                 request_sent = true;
             }
             loop {

@@ -10,10 +10,9 @@ use ring::{
 };
 use std::{
     collections::HashMap,
-    fs::read,
     io::{ErrorKind as IOErrorKind, Read},
     net::{IpAddr, SocketAddr},
-    path::{Component, Path, PathBuf},
+    path::Path,
     pin::Pin,
     sync::{
         atomic::{AtomicUsize, Ordering::Relaxed},
@@ -97,7 +96,7 @@ fn events_loop(
             }
 
             if events.is_empty() {
-                warn!("timed out");
+                warn!("timed out after {:?}", timeout);
 
                 clients.values_mut().for_each(|(_, c)| c.conn.on_timeout());
 
@@ -282,22 +281,14 @@ fn events_loop(
                         .tap_ok(|(stream_id, event)| {
                             debug!("Event received for stream {}: {:?}", stream_id, event)
                         }) {
-                        Ok((stream_id, quiche::h3::Event::Headers { list, has_body })) => {
-                            // client
-                            //     .partial_requests
-                            //     .entry(stream_id)
-                            //     .and_modify(|request| {
-                            //         request.headers.extend_from_slice(&list);
-                            //     })
-                            //     .or_insert(PartialRequest {
-                            //         headers: list,
-                            //         body: Default::default(),
-                            //     });
-                            if !has_body {
-                                handle_request(client, stream_id, &list, "/etc");
-                            } else {
-                                unimplemented!();
-                            }
+                        Ok((stream_id, quiche::h3::Event::Headers { list, .. })) => {
+                            client
+                                .partial_requests
+                                .entry(stream_id)
+                                .or_insert(PartialRequest {
+                                    headers: list,
+                                    body: Default::default(),
+                                });
                         }
 
                         Ok((stream_id, quiche::h3::Event::Data)) => {
@@ -329,7 +320,9 @@ fn events_loop(
                             }
                         }
 
-                        Ok((_stream_id, quiche::h3::Event::Finished)) => (),
+                        Ok((stream_id, quiche::h3::Event::Finished)) => {
+                            handle_request(client, stream_id);
+                        }
 
                         Ok((_flow_id, quiche::h3::Event::Datagram)) => (),
 
@@ -464,69 +457,68 @@ fn make_quiche_config() -> anyhow::Result<quiche::Config> {
     Ok(config)
 }
 
-fn handle_request(client: &mut Client, stream_id: u64, headers: &[h3::Header], root: &str) {
+fn handle_request(client: &mut Client, stream_id: u64) {
     let conn = &mut client.conn;
     let http3_conn = &mut client.http3_conn.as_mut().unwrap();
 
-    info!(
-        "{} got request {:?} on stream id {}",
-        conn.trace_id(),
-        headers,
-        stream_id
-    );
+    if let Some(request) = client.partial_requests.get(&stream_id) {
+        info!(
+            "{} got request {:?} body length {} on stream id {}",
+            conn.trace_id(),
+            request.headers,
+            request.body.len(),
+            stream_id
+        );
 
-    conn.stream_shutdown(stream_id, quiche::Shutdown::Read, 0)
-        .unwrap();
+        conn.stream_shutdown(stream_id, quiche::Shutdown::Read, 0)
+            .unwrap();
 
-    let (headers, body) = build_response(root, headers);
+        let (headers, body) = build_response(request);
 
-    match http3_conn.send_response(conn, stream_id, &headers, false) {
-        Ok(v) => v,
-        Err(h3::Error::StreamBlocked) => {
+        match http3_conn.send_response(conn, stream_id, &headers, false) {
+            Ok(v) => v,
+            Err(h3::Error::StreamBlocked) => {
+                let response = PartialResponse {
+                    headers: Some(headers),
+                    body,
+                    written: 0,
+                };
+
+                client.partial_responses.insert(stream_id, response);
+                return;
+            }
+            Err(e) => {
+                error!("{} stream send failed {:?}", conn.trace_id(), e);
+                return;
+            }
+        }
+
+        let written = match http3_conn.send_body(conn, stream_id, &body, true) {
+            Ok(v) => v,
+            Err(quiche::h3::Error::Done) => 0,
+            Err(e) => {
+                error!("{} stream send failed {:?}", conn.trace_id(), e);
+                return;
+            }
+        };
+
+        if written < body.len() {
             let response = PartialResponse {
-                headers: Some(headers),
+                headers: None,
                 body,
-                written: 0,
+                written,
             };
 
             client.partial_responses.insert(stream_id, response);
-            return;
         }
-        Err(e) => {
-            error!("{} stream send failed {:?}", conn.trace_id(), e);
-            return;
-        }
-    }
-
-    let written = match http3_conn.send_body(conn, stream_id, &body, true) {
-        Ok(v) => v,
-        Err(quiche::h3::Error::Done) => 0,
-        Err(e) => {
-            error!("{} stream send failed {:?}", conn.trace_id(), e);
-            return;
-        }
-    };
-
-    if written < body.len() {
-        let response = PartialResponse {
-            headers: None,
-            body,
-            written,
-        };
-
-        client.partial_responses.insert(stream_id, response);
     }
 }
 
-fn build_response(
-    root: &str,
-    request: &[quiche::h3::Header],
-) -> (Vec<quiche::h3::Header>, Vec<u8>) {
-    let mut file_path = PathBuf::from(root);
+fn build_response(request: &PartialRequest) -> (Vec<quiche::h3::Header>, Vec<u8>) {
     let mut path = Path::new("");
     let mut method = "";
 
-    for hdr in request {
+    for hdr in request.headers.iter() {
         match hdr.name() {
             ":path" => {
                 path = Path::new(hdr.value());
@@ -538,19 +530,13 @@ fn build_response(
         }
     }
     let (status, body) = match method {
-        "GET" => {
-            for c in path.components() {
-                if let Component::Normal(v) = c {
-                    file_path.push(v)
-                }
-            }
-
-            match read(&file_path) {
-                Ok(data) => (200, data),
-                Err(_) => (404, b"Not Found!".to_vec()),
+        "POST" => {
+            if path == Path::new("/") {
+                (200, b"{\"key\":\"testkey\",\"hash\":\"testhash\"}".to_vec())
+            } else {
+                (404, b"Not Found!".to_vec())
             }
         }
-
         _ => (405, Vec::new()),
     };
 
