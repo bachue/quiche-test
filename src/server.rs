@@ -97,9 +97,7 @@ fn events_loop(
 
             if events.is_empty() {
                 warn!("timed out after {:?}", timeout);
-
                 clients.values_mut().for_each(|(_, c)| c.conn.on_timeout());
-
                 break 'read;
             }
 

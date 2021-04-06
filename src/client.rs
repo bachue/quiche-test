@@ -11,7 +11,7 @@ use log::{debug, error, info};
 use quiche::h3;
 use rayon::ThreadPoolBuilder;
 use ring::rand::{SecureRandom, SystemRandom};
-const TASK_COUNT: usize = 10;
+const TASK_COUNT: usize = 100;
 const WORKER_COUNT: usize = 10;
 const REQ_CNT_FOR_EACH_TASK: usize = 10;
 
@@ -117,9 +117,7 @@ fn start_client_worker(bind_addr: SocketAddr, server_address: SocketAddr) -> any
         'read: loop {
             if events.is_empty() {
                 debug!("timed out");
-
                 conn.on_timeout();
-
                 break 'read;
             }
 
