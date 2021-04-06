@@ -16,7 +16,7 @@ const ONE_GB: u64 = 1 << 30;
 fn main() -> IOResult<()> {
     env_logger::init();
 
-    let server_address = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 4433);
+    let server_address = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 4433);
     let server_socket = mio::net::UdpSocket::bind(server_address)?;
     let tasks_number = new_tasks_number();
     let (sender, receiver) = mio::unix::pipe::new()?;

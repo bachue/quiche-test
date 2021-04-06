@@ -529,7 +529,7 @@ fn build_response(request: &PartialRequest) -> (Vec<quiche::h3::Header>, Vec<u8>
     }
     let (status, body) = match method {
         "POST" => {
-            if path == Path::new("/") {
+            if path.starts_with("/put/") {
                 (200, b"{\"key\":\"testkey\",\"hash\":\"testhash\"}".to_vec())
             } else {
                 (404, b"Not Found!".to_vec())

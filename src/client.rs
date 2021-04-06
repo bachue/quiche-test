@@ -11,9 +11,11 @@ use log::{debug, error, info};
 use quiche::h3;
 use rayon::ThreadPoolBuilder;
 use ring::rand::{SecureRandom, SystemRandom};
-const TASK_COUNT: usize = 100;
-const WORKER_COUNT: usize = 10;
-const REQ_CNT_FOR_EACH_TASK: usize = 10;
+const TASK_COUNT: usize = 2;
+const WORKER_COUNT: usize = 2;
+const REQ_CNT_FOR_EACH_TASK: usize = 2;
+const SERVER_NAME: &str = "up.qiniu.com";
+const UPLOAD_TOKEN: &str = "HwFOxpYCQU6oXoZXFOTh1mq5ZZig6Yyocgk3BTZZ:eJ4mCfwJjaQ_iycI2x6vk0qFiXA=:eyJkZWFkbGluZSI6MTY0OTIyNjI4NCwic2NvcGUiOiIyMDIwLTA2LWNoZWNrYmlsbHMifQ==";
 
 pub(super) fn new_tasks_number() -> Arc<AtomicUsize> {
     return Arc::new(AtomicUsize::new(TASK_COUNT));
@@ -45,13 +47,13 @@ pub(super) fn start_clients(
             .thread_name(|i| format!("quiche client worker - {}", i))
             .build()?
             .scope(|s| {
-                for _ in 0..TASK_COUNT {
+                for i in 0..TASK_COUNT {
                     let tasks_number = tasks_number.to_owned();
                     let sender = sender.to_owned();
                     s.spawn(move |_| {
                         let _tasks_number_guard = TasksNumberGuard::new(tasks_number, sender);
-                        for _ in 0..REQ_CNT_FOR_EACH_TASK {
-                            start_client_worker(bind_addr, server_address)
+                        for j in 0..REQ_CNT_FOR_EACH_TASK {
+                            start_client_worker(bind_addr, server_address, &format!("{}-{}", i, j))
                                 .expect("Client worker failed")
                         }
                     });
@@ -61,7 +63,11 @@ pub(super) fn start_clients(
         Ok(())
     }
 }
-fn start_client_worker(bind_addr: SocketAddr, server_address: SocketAddr) -> anyhow::Result<()> {
+fn start_client_worker(
+    bind_addr: SocketAddr,
+    server_address: SocketAddr,
+    task_id: &str,
+) -> anyhow::Result<()> {
     let mut socket = mio::net::UdpSocket::bind(bind_addr)?;
     socket.connect(server_address)?;
     let random = SystemRandom::new();
@@ -75,9 +81,10 @@ fn start_client_worker(bind_addr: SocketAddr, server_address: SocketAddr) -> any
     let mut scid = [0; quiche::MAX_CONN_ID_LEN];
     random.fill(&mut scid[..]).unwrap();
     let scid = quiche::ConnectionId::from_ref(&scid);
-    let mut conn = quiche::connect(Some("localhost"), &scid, &mut config).unwrap();
+    let mut conn = quiche::connect(Some(SERVER_NAME), &scid, &mut config).unwrap();
     info!(
-        "connecting to {:} from {:} with scid {}",
+        "[{}] connecting to {:} from {:} with scid {}",
+        task_id,
         server_address,
         socket.local_addr().unwrap(),
         hex::encode(&scid)
@@ -89,25 +96,30 @@ fn start_client_worker(bind_addr: SocketAddr, server_address: SocketAddr) -> any
 
     while let Err(err) = socket.send(&out[..written]) {
         if err.kind() == IOErrorKind::WouldBlock {
-            debug!("send() would block");
+            debug!("[{}] send() would block", task_id);
             continue;
         }
 
-        bail!("send() failed: {:?}", err);
+        bail!("[{}] send() failed: {:?}", task_id, err);
     }
-    debug!("written {}", written);
+    debug!("[{}] written {}", task_id, written);
 
     let h3_config = quiche::h3::Config::new().unwrap();
+    const FILE_SIZE: usize = 1 << 20;
     let request_headers = vec![
         h3::Header::new(":method", "POST"),
         h3::Header::new(":scheme", "https"),
-        h3::Header::new(":authority", "localhost"),
-        h3::Header::new(":path", "/"),
-        h3::Header::new("user-agent", "quiche"),
+        h3::Header::new(":authority", SERVER_NAME),
+        h3::Header::new(":path", &format!("/put/{}", FILE_SIZE)),
+        h3::Header::new("user-agent", "quiche-test-client"),
+        h3::Header::new("authorization", &format!("UpToken {}", UPLOAD_TOKEN)),
     ];
     let request_begin_at = Instant::now();
-    let mut request_sent = false;
+    let mut stream_id = None;
+    let mut request_body_sent = 0usize;
     let mut received_total = 0usize;
+    let mut request_body = vec![0u8; FILE_SIZE];
+    random.fill(&mut request_body).unwrap();
 
     let mut events = mio::Events::with_capacity(1024);
 
@@ -116,7 +128,7 @@ fn start_client_worker(bind_addr: SocketAddr, server_address: SocketAddr) -> any
 
         'read: loop {
             if events.is_empty() {
-                debug!("timed out");
+                debug!("[{}] timed out", task_id);
                 conn.on_timeout();
                 break 'read;
             }
@@ -125,29 +137,29 @@ fn start_client_worker(bind_addr: SocketAddr, server_address: SocketAddr) -> any
                 Ok(v) => v,
                 Err(e) => {
                     if e.kind() == IOErrorKind::WouldBlock {
-                        debug!("recv() would block");
+                        debug!("[{}] recv() would block", task_id);
                         break 'read;
                     }
-                    bail!("recv() failed: {:?}", e);
+                    bail!("[{}] recv() failed: {:?}", task_id, e);
                 }
             };
-            debug!("got {} bytes", len);
+            debug!("[{}] got {} bytes", task_id, len);
 
             let read = match conn.recv(&mut buf[..len]) {
                 Ok(v) => v,
                 Err(e) => {
-                    error!("recv failed: {:?}", e);
+                    error!("[{}] recv failed: {:?}", task_id, e);
                     continue 'read;
                 }
             };
 
-            debug!("processed {} bytes", read);
+            debug!("[{}] processed {} bytes", task_id, read);
         }
 
-        debug!("done reading");
+        debug!("[{}] done reading", task_id);
 
         if conn.is_closed() {
-            info!("connection closed, {:?}", conn.stats());
+            info!("[{}] connection closed, {:?}", task_id, conn.stats());
             break;
         }
 
@@ -156,42 +168,52 @@ fn start_client_worker(bind_addr: SocketAddr, server_address: SocketAddr) -> any
         }
 
         if let Some(http3_conn) = &mut http3_conn {
-            if !request_sent {
-                info!("sending HTTP request {:?}", request_headers);
+            if stream_id.is_none() {
+                info!("[{}] sending HTTP request {:?}", task_id, request_headers);
 
-                let stream_id = http3_conn
-                    .send_request(&mut conn, &request_headers, false)
-                    .unwrap();
-
-                let mut body = vec![0u8; 4194304];
-                random.fill(&mut body).unwrap();
-                let mut have_written = 0;
-                while have_written < body.len() {
-                    let written = http3_conn
-                        .send_body(&mut conn, stream_id, &body[have_written..], true)
-                        .unwrap();
-                    have_written += written;
+                stream_id = Some(
+                    http3_conn
+                        .send_request(&mut conn, &request_headers, false)
+                        .unwrap(),
+                );
+            }
+            if let Some(stream_id) = stream_id {
+                if request_body_sent < request_body.len() {
+                    let body = &request_body[request_body_sent..];
+                    match http3_conn.send_body(&mut conn, stream_id, body, true) {
+                        Ok(written) => {
+                            debug!("[{}] Send {} bytes for body", task_id, written);
+                            request_body_sent += written;
+                        }
+                        Err(h3::Error::Done) => {
+                            debug!("[{}] Wait for a while to send body", task_id);
+                        }
+                        Err(err) => {
+                            bail!("[{}] Failed to send body: {}", task_id, err);
+                        }
+                    };
                 }
-
-                request_sent = true;
             }
             loop {
                 match http3_conn.poll(&mut conn) {
                     Ok((stream_id, h3::Event::Headers { list, .. })) => {
-                        info!("got response headers {:?} on stream id {}", list, stream_id);
+                        info!(
+                            "[{}] got response headers {:?} on stream id {}",
+                            task_id, list, stream_id
+                        );
                     }
                     Ok((stream_id, h3::Event::Data)) => {
                         if let Ok(read) = http3_conn.recv_body(&mut conn, stream_id, &mut buf) {
                             debug!(
-                                "got {} bytes of response data on stream {}",
-                                read, stream_id
+                                "[{}] got {} bytes of response data on stream {}",
+                                task_id, read, stream_id
                             );
                             received_total += read;
                         }
                     }
                     Ok((stream_id, h3::Event::Finished)) => {
                         info!(
-                            "response received in {:?} on stream id {}, body length {}, closing...",
+                            "[{}] response received in {:?} on stream id {}, body length {}, closing...", task_id,
                             request_begin_at.elapsed(),
                             stream_id,
                             received_total,
@@ -200,13 +222,13 @@ fn start_client_worker(bind_addr: SocketAddr, server_address: SocketAddr) -> any
                     }
                     Ok((_flow_id, h3::Event::Datagram)) => (),
                     Ok((goaway_id, h3::Event::GoAway)) => {
-                        info!("GOAWAY id={}", goaway_id);
+                        info!("[{}] GOAWAY id={}", task_id, goaway_id);
                     }
                     Err(h3::Error::Done) => {
                         break;
                     }
                     Err(e) => {
-                        error!("HTTP/3 processing failed: {:?}", e);
+                        error!("[{}] HTTP/3 processing failed: {:?}", task_id, e);
                         break;
                     }
                 }
@@ -217,11 +239,11 @@ fn start_client_worker(bind_addr: SocketAddr, server_address: SocketAddr) -> any
             let written = match conn.send(&mut out) {
                 Ok(v) => v,
                 Err(quiche::Error::Done) => {
-                    debug!("done writing");
+                    debug!("[{}] done writing", task_id);
                     break;
                 }
                 Err(err) => {
-                    error!("send failed: {:?}", err);
+                    error!("[{}] send failed: {:?}", task_id, err);
                     conn.close(false, 0x1, b"fail").ok();
                     break;
                 }
@@ -229,18 +251,18 @@ fn start_client_worker(bind_addr: SocketAddr, server_address: SocketAddr) -> any
 
             if let Err(e) = socket.send(&out[..written]) {
                 if e.kind() == IOErrorKind::WouldBlock {
-                    debug!("send() would block");
+                    debug!("[{}] send() would block", task_id);
                     break;
                 }
 
-                bail!("send() failed: {:?}", e);
+                bail!("[{}] send() failed: {:?}", task_id, e);
             }
 
-            debug!("written {}", written);
+            debug!("[{}] written {}", task_id, written);
         }
 
         if conn.is_closed() {
-            info!("connection closed, {:?}", conn.stats());
+            info!("[{}] connection closed, {:?}", task_id, conn.stats());
             break;
         }
     }
