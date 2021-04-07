@@ -177,51 +177,12 @@ fn events_loop(
                     }
                     continue 'read;
                 }
-                let mut scid = [0; MAX_CONN_ID_LEN];
+                let mut scid = vec![0; MAX_CONN_ID_LEN];
                 scid.copy_from_slice(&conn_id);
-                let scid = ConnectionId::from_ref(&scid);
-                let token = hdr.token.as_ref().unwrap();
-                if token.is_empty() {
-                    warn!("Doing stateless retry");
-
-                    let new_token = mint_token(&hdr, src);
-                    let len = quiche::retry(
-                        &hdr.scid,
-                        &hdr.dcid,
-                        &scid,
-                        &new_token,
-                        hdr.version,
-                        &mut out,
-                    )?;
-                    let out = &out[..len];
-
-                    if let Err(e) = socket.send_to(out, src) {
-                        if e.kind() == IOErrorKind::WouldBlock {
-                            debug!("send() would block");
-                            break;
-                        }
-
-                        bail!("send() failed: {:?}", e);
-                    }
-                    continue 'read;
-                }
-                let odcid = validate_token(src, token);
-
-                if odcid.is_none() {
-                    error!("Invalid address validation token");
-                    continue 'read;
-                }
-
-                if scid.len() != hdr.dcid.len() {
-                    error!("Invalid destination connection ID");
-                    continue 'read;
-                }
-
-                let scid = hdr.dcid.clone();
-
+                let scid = ConnectionId::from_vec(scid);
                 debug!("New connection: dcid={:?} scid={:?}", hdr.dcid, scid);
 
-                let conn = quiche::accept(&scid, odcid.as_ref(), &mut config)?;
+                let conn = quiche::accept(&scid, None, &mut config)?;
 
                 let client = Client {
                     conn,
@@ -388,50 +349,6 @@ fn events_loop(
 
     info!("Clients count: {}", CLIENTS_COUNTER.load(Relaxed));
     Ok(())
-}
-
-const TOKEN_PREFIX: &[u8] = b"quiche";
-
-fn mint_token(hdr: &quiche::Header, src: SocketAddr) -> Vec<u8> {
-    let mut token = Vec::new();
-
-    token.extend_from_slice(TOKEN_PREFIX);
-
-    let addr = match src.ip() {
-        IpAddr::V4(a) => a.octets().to_vec(),
-        IpAddr::V6(a) => a.octets().to_vec(),
-    };
-
-    token.extend_from_slice(&addr);
-    token.extend_from_slice(&hdr.dcid);
-
-    token
-}
-
-fn validate_token<'a>(src: SocketAddr, token: &'a [u8]) -> Option<quiche::ConnectionId<'a>> {
-    const TOKEN_PREFIX_LEN: usize = TOKEN_PREFIX.len();
-
-    if token.len() < TOKEN_PREFIX_LEN {
-        return None;
-    }
-
-    if &token[..TOKEN_PREFIX_LEN] != TOKEN_PREFIX {
-        return None;
-    }
-
-    let token = &token[TOKEN_PREFIX_LEN..];
-
-    let addr = match src.ip() {
-        IpAddr::V4(a) => a.octets().to_vec(),
-        IpAddr::V6(a) => a.octets().to_vec(),
-    };
-
-    if token.len() < addr.len() || &token[..addr.len()] != addr.as_slice() {
-        return None;
-    }
-
-    let token = &token[addr.len()..];
-    Some(ConnectionId::from_ref(&token[..]))
 }
 
 fn make_quiche_config() -> anyhow::Result<quiche::Config> {

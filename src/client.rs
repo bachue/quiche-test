@@ -11,9 +11,9 @@ use log::{debug, error, info};
 use quiche::h3;
 use rayon::ThreadPoolBuilder;
 use ring::rand::{SecureRandom, SystemRandom};
-const TASK_COUNT: usize = 2;
-const WORKER_COUNT: usize = 2;
-const REQ_CNT_FOR_EACH_TASK: usize = 2;
+const TASK_COUNT: usize = 10;
+const WORKER_COUNT: usize = 10;
+const REQ_CNT_FOR_EACH_TASK: usize = 10;
 const SERVER_NAME: &str = "up.qiniu.com";
 const UPLOAD_TOKEN: &str = "HwFOxpYCQU6oXoZXFOTh1mq5ZZig6Yyocgk3BTZZ:eJ4mCfwJjaQ_iycI2x6vk0qFiXA=:eyJkZWFkbGluZSI6MTY0OTIyNjI4NCwic2NvcGUiOiIyMDIwLTA2LWNoZWNrYmlsbHMifQ==";
 
