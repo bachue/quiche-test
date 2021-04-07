@@ -327,7 +327,12 @@ fn events_loop(
                     bail!("send() failed: {:?}", e);
                 }
 
-                debug!("{} written {} bytes", client.conn.trace_id(), written);
+                debug!(
+                    "{} written {} bytes to {:?}",
+                    client.conn.trace_id(),
+                    written,
+                    peer
+                );
             }
         }
 
