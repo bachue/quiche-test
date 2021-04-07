@@ -133,7 +133,7 @@ fn events_loop(
                     bail!("recv() failed: {:?}", e);
                 }
             };
-            debug!("got {} bytes", len);
+            debug!("got {} bytes from {:?}", len, src);
 
             let pkt_buf = &mut buf[..len];
             let hdr = match Header::from_slice(pkt_buf, MAX_CONN_ID_LEN) {
