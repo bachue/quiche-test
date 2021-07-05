@@ -14,7 +14,7 @@ const MAX_DATAGRAM_SIZE: usize = 1350;
 const ONE_GB: u64 = 1 << 30;
 
 fn main() -> IOResult<()> {
-    env_logger::init();
+    env_logger::builder().format_timestamp_micros().init();
 
     let server_address = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 4433);
     let server_socket = mio::net::UdpSocket::bind(server_address)?;

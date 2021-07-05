@@ -252,10 +252,10 @@ fn start_client_worker(
                 }
             };
 
-            if let Err(e) = socket.send_to(&out[..written], send_info.to) {
+            while let Err(e) = socket.send_to(&out[..written], send_info.to) {
                 if e.kind() == IOErrorKind::WouldBlock {
                     debug!("[{}] send() would block", task_id);
-                    break;
+                    continue;
                 }
 
                 bail!("[{}] send() failed: {:?}", task_id, e);

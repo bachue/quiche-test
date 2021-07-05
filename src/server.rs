@@ -177,10 +177,10 @@ fn events_loop(
                     let len = quiche::negotiate_version(&hdr.scid, &hdr.dcid, &mut out).unwrap();
                     let out = &out[..len];
 
-                    if let Err(e) = socket.send_to(out, src) {
+                    while let Err(e) = socket.send_to(out, src) {
                         if e.kind() == IOErrorKind::WouldBlock {
                             debug!("send() would block");
-                            break;
+                            continue;
                         }
                         bail!("send() failed: {:?}", e);
                     }
@@ -329,10 +329,10 @@ fn events_loop(
                     }
                 };
 
-                if let Err(e) = socket.send_to(&out[..written], send_info.to) {
+                while let Err(e) = socket.send_to(&out[..written], send_info.to) {
                     if e.kind() == IOErrorKind::WouldBlock {
                         debug!("send() would block");
-                        break;
+                        continue;
                     }
 
                     bail!("send() failed: {:?}", e);
