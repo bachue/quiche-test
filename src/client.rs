@@ -11,7 +11,7 @@ use log::{debug, error, info};
 use quiche::h3;
 use rayon::ThreadPoolBuilder;
 use ring::rand::{SecureRandom, SystemRandom};
-const TASK_COUNT: usize = 10;
+const TASK_COUNT: usize = 1000;
 const WORKER_COUNT: usize = 10;
 const REQ_CNT_FOR_EACH_TASK: usize = 10;
 const SERVER_NAME: &str = "up.qiniu.com";
@@ -81,7 +81,7 @@ fn start_client_worker(
     let mut scid = [0; quiche::MAX_CONN_ID_LEN];
     random.fill(&mut scid[..]).unwrap();
     let scid = quiche::ConnectionId::from_ref(&scid);
-    let mut conn = quiche::connect(Some(SERVER_NAME), &scid, &mut config).unwrap();
+    let mut conn = quiche::connect(Some(SERVER_NAME), &scid, server_address, &mut config).unwrap();
     info!(
         "[{}] connecting to {:} from {:} with scid {}",
         task_id,
@@ -92,9 +92,9 @@ fn start_client_worker(
 
     let mut buf = [0; 65535];
     let mut out = [0; MAX_DATAGRAM_SIZE];
-    let written = conn.send(&mut out).context("initial send failed")?;
+    let (written, send_info) = conn.send(&mut out).context("initial send failed")?;
 
-    while let Err(err) = socket.send(&out[..written]) {
+    while let Err(err) = socket.send_to(&out[..written], send_info.to) {
         if err.kind() == IOErrorKind::WouldBlock {
             debug!("[{}] send() would block", task_id);
             continue;
@@ -107,12 +107,15 @@ fn start_client_worker(
     let h3_config = quiche::h3::Config::new().unwrap();
     const FILE_SIZE: usize = 1 << 20;
     let request_headers = vec![
-        h3::Header::new(":method", "POST"),
-        h3::Header::new(":scheme", "https"),
-        h3::Header::new(":authority", SERVER_NAME),
-        h3::Header::new(":path", &format!("/put/{}", FILE_SIZE)),
-        h3::Header::new("user-agent", "quiche-test-client"),
-        h3::Header::new("authorization", &format!("UpToken {}", UPLOAD_TOKEN)),
+        h3::Header::new(b":method", b"POST"),
+        h3::Header::new(b":scheme", b"https"),
+        h3::Header::new(b":authority", SERVER_NAME.as_bytes()),
+        h3::Header::new(b":path", format!("/put/{}", FILE_SIZE).as_bytes()),
+        h3::Header::new(b"user-agent", b"quiche-test-client"),
+        h3::Header::new(
+            b"authorization",
+            format!("UpToken {}", UPLOAD_TOKEN).as_bytes(),
+        ),
     ];
     let request_begin_at = Instant::now();
     let mut stream_id = None;
@@ -133,7 +136,7 @@ fn start_client_worker(
                 break 'read;
             }
 
-            let len = match socket.recv(&mut buf) {
+            let (len, from_addr) = match socket.recv_from(&mut buf) {
                 Ok(v) => v,
                 Err(e) => {
                     if e.kind() == IOErrorKind::WouldBlock {
@@ -145,7 +148,7 @@ fn start_client_worker(
             };
             debug!("[{}] got {} bytes", task_id, len);
 
-            let read = match conn.recv(&mut buf[..len]) {
+            let read = match conn.recv(&mut buf[..len], quiche::RecvInfo { from: from_addr }) {
                 Ok(v) => v,
                 Err(e) => {
                     error!("[{}] recv failed: {:?}", task_id, e);
@@ -169,7 +172,7 @@ fn start_client_worker(
 
         if let Some(http3_conn) = &mut http3_conn {
             if stream_id.is_none() {
-                info!("[{}] sending HTTP request {:?}", task_id, request_headers);
+                info!("[{}] sending HTTP request", task_id);
 
                 stream_id = Some(
                     http3_conn
@@ -196,10 +199,10 @@ fn start_client_worker(
             }
             loop {
                 match http3_conn.poll(&mut conn) {
-                    Ok((stream_id, h3::Event::Headers { list, .. })) => {
+                    Ok((stream_id, h3::Event::Headers { .. })) => {
                         info!(
-                            "[{}] got response headers {:?} on stream id {}",
-                            task_id, list, stream_id
+                            "[{}] got response headers on stream id {}",
+                            task_id, stream_id
                         );
                     }
                     Ok((stream_id, h3::Event::Data)) => {
@@ -236,7 +239,7 @@ fn start_client_worker(
         }
 
         loop {
-            let written = match conn.send(&mut out) {
+            let (written, send_info) = match conn.send(&mut out) {
                 Ok(v) => v,
                 Err(quiche::Error::Done) => {
                     debug!("[{}] done writing", task_id);
@@ -249,7 +252,7 @@ fn start_client_worker(
                 }
             };
 
-            if let Err(e) = socket.send(&out[..written]) {
+            if let Err(e) = socket.send_to(&out[..written], send_info.to) {
                 if e.kind() == IOErrorKind::WouldBlock {
                     debug!("[{}] send() would block", task_id);
                     break;

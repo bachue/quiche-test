@@ -1,4 +1,5 @@
 use anyhow::bail;
+use dashmap::DashMap;
 use log::{debug, error, info, warn};
 use quiche::{
     h3::{self, NameValue},
@@ -11,8 +12,7 @@ use ring::{
 use std::{
     collections::HashMap,
     io::{ErrorKind as IOErrorKind, Read},
-    net::{IpAddr, SocketAddr},
-    path::Path,
+    net::SocketAddr,
     pin::Pin,
     sync::{
         atomic::{AtomicUsize, Ordering::Relaxed},
@@ -41,7 +41,7 @@ struct Client {
     partial_responses: HashMap<u64, PartialResponse>,
 }
 
-type ClientMap = HashMap<ConnectionId<'static>, (SocketAddr, Client)>;
+type ClientMap = DashMap<ConnectionId<'static>, (SocketAddr, Client)>;
 
 const SERVER_TOKEN: mio::Token = mio::Token(0);
 const RECEIVER_TOKEN: mio::Token = mio::Token(1);
@@ -83,10 +83,16 @@ fn events_loop(
     let mut config = make_quiche_config()?;
     let h3_config = h3::Config::new()?;
     let conn_id_seed = Key::generate(HMAC_SHA256, &SystemRandom::new()).unwrap();
-    let mut clients = ClientMap::new();
+    let clients = Arc::new(ClientMap::new());
 
     'events: while tasks_number.load(Relaxed) > 0 {
-        let timeout = clients.values().filter_map(|(_, c)| c.conn.timeout()).min();
+        let timeout = clients
+            .iter()
+            .filter_map(|r| {
+                let (_, c) = r.value();
+                c.conn.timeout()
+            })
+            .min();
 
         poll.poll(&mut events, timeout)?;
 
@@ -97,7 +103,10 @@ fn events_loop(
 
             if events.is_empty() {
                 warn!("timed out after {:?}", timeout);
-                clients.values_mut().for_each(|(_, c)| c.conn.on_timeout());
+                clients.iter_mut().for_each(|mut r| {
+                    let (_, c) = r.value_mut();
+                    c.conn.on_timeout()
+                });
                 break 'read;
             }
 
@@ -152,7 +161,7 @@ fn events_loop(
                 conn_id.to_vec().into()
             };
 
-            let (_, client) = if clients.contains_key(&hdr.dcid) || clients.contains_key(&conn_id) {
+            let mut r = if clients.contains_key(&hdr.dcid) || clients.contains_key(&conn_id) {
                 match clients.get_mut(&hdr.dcid) {
                     Some(v) => v,
                     None => clients.get_mut(&conn_id).unwrap(),
@@ -182,7 +191,7 @@ fn events_loop(
                 let scid = ConnectionId::from_vec(scid);
                 debug!("New connection: dcid={:?} scid={:?}", hdr.dcid, scid);
 
-                let conn = quiche::accept(&scid, None, &mut config)?;
+                let conn = quiche::accept(&scid, None, src, &mut config)?;
 
                 let client = Client {
                     conn,
@@ -196,8 +205,9 @@ fn events_loop(
                 }
                 clients.get_mut(&scid).unwrap()
             };
+            let (_, client) = &mut r.value_mut();
 
-            let read = match client.conn.recv(pkt_buf) {
+            let read = match client.conn.recv(pkt_buf, quiche::RecvInfo { from: src }) {
                 Ok(v) => v,
                 Err(e) => {
                     error!("{} recv failed: {:?}", client.conn.trace_id(), e);
@@ -300,9 +310,10 @@ fn events_loop(
                 }
             }
         }
-        for (peer, client) in clients.values_mut() {
+        for mut r in clients.iter_mut() {
+            let (_, client) = r.value_mut();
             loop {
-                let written = match client.conn.send(&mut out) {
+                let (written, send_info) = match client.conn.send(&mut out) {
                     Ok(v) => v,
 
                     Err(quiche::Error::Done) => {
@@ -318,7 +329,7 @@ fn events_loop(
                     }
                 };
 
-                if let Err(e) = socket.send_to(&out[..written], *peer) {
+                if let Err(e) = socket.send_to(&out[..written], send_info.to) {
                     if e.kind() == IOErrorKind::WouldBlock {
                         debug!("send() would block");
                         break;
@@ -331,7 +342,7 @@ fn events_loop(
                     "{} written {} bytes to {:?}",
                     client.conn.trace_id(),
                     written,
-                    peer
+                    send_info.to,
                 );
             }
         }
@@ -381,11 +392,10 @@ fn handle_request(client: &mut Client, stream_id: u64) {
     let conn = &mut client.conn;
     let http3_conn = &mut client.http3_conn.as_mut().unwrap();
 
-    if let Some(request) = client.partial_requests.get(&stream_id) {
+    if let Some(request) = client.partial_requests.remove(&stream_id) {
         info!(
-            "{} got request {:?} body length {} on stream id {}",
+            "{} got request body length {} on stream id {}",
             conn.trace_id(),
-            request.headers,
             request.body.len(),
             stream_id
         );
@@ -393,7 +403,7 @@ fn handle_request(client: &mut Client, stream_id: u64) {
         conn.stream_shutdown(stream_id, quiche::Shutdown::Read, 0)
             .unwrap();
 
-        let (headers, body) = build_response(request);
+        let (headers, body) = build_response(&request);
 
         match http3_conn.send_response(conn, stream_id, &headers, false) {
             Ok(v) => v,
@@ -435,35 +445,25 @@ fn handle_request(client: &mut Client, stream_id: u64) {
 }
 
 fn build_response(request: &PartialRequest) -> (Vec<quiche::h3::Header>, Vec<u8>) {
-    let mut path = Path::new("");
-    let mut method = "";
+    let mut method: &[u8] = &[];
 
     for hdr in request.headers.iter() {
         match hdr.name() {
-            ":path" => {
-                path = Path::new(hdr.value());
-            }
-            ":method" => {
+            b":path" => {
                 method = hdr.value();
             }
             _ => (),
         }
     }
     let (status, body) = match method {
-        "POST" => {
-            if path.starts_with("/put/") {
-                (200, b"{\"key\":\"testkey\",\"hash\":\"testhash\"}".to_vec())
-            } else {
-                (404, b"Not Found!".to_vec())
-            }
-        }
+        b"POST" => (200, b"{\"key\":\"testkey\",\"hash\":\"testhash\"}".to_vec()),
         _ => (405, Vec::new()),
     };
 
     let headers = vec![
-        h3::Header::new(":status", &status.to_string()),
-        h3::Header::new("server", "quiche"),
-        h3::Header::new("content-length", &body.len().to_string()),
+        h3::Header::new(b":status", status.to_string().as_bytes()),
+        h3::Header::new(b"server", b"quiche"),
+        h3::Header::new(b"content-length", body.len().to_string().as_bytes()),
     ];
 
     (headers, body)

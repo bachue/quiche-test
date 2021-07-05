@@ -31,15 +31,15 @@ fn main() -> IOResult<()> {
             })
             .unwrap()
     });
-    // threads.push({
-    //     let tasks_number = tasks_number.to_owned();
-    //     ThreadBuilder::new()
-    //         .name("quiche clients".to_owned())
-    //         .spawn(move || {
-    //             start_clients(server_address, tasks_number, sender);
-    //         })
-    //         .unwrap()
-    // });
+    threads.push({
+        let tasks_number = tasks_number.to_owned();
+        ThreadBuilder::new()
+            .name("quiche clients".to_owned())
+            .spawn(move || {
+                start_clients(server_address, tasks_number, sender);
+            })
+            .unwrap()
+    });
 
     for thread in threads {
         thread.join().unwrap();
