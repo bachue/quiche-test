@@ -1,3 +1,7 @@
+use crate::{
+    benchmarks::{elapsed, now, BYTES_LEN as BENCHMARK_LEN},
+    MAX_DATAGRAM_SIZE, ONE_GB,
+};
 use anyhow::bail;
 use dashmap::DashMap;
 use log::{debug, error, info, warn};
@@ -20,8 +24,6 @@ use std::{
     },
 };
 use tap::prelude::*;
-
-use crate::{MAX_DATAGRAM_SIZE, ONE_GB};
 
 struct PartialRequest {
     headers: Vec<h3::Header>,
@@ -79,7 +81,7 @@ fn events_loop(
 ) -> anyhow::Result<()> {
     let mut events = mio::Events::with_capacity(1024);
     let mut buf = [0; 65535];
-    let mut out = [0; MAX_DATAGRAM_SIZE];
+    let mut out = [0; MAX_DATAGRAM_SIZE + BENCHMARK_LEN];
     let mut config = make_quiche_config()?;
     let h3_config = h3::Config::new()?;
     let conn_id_seed = Key::generate(HMAC_SHA256, &SystemRandom::new()).unwrap();
@@ -129,7 +131,7 @@ fn events_loop(
                 break 'read;
             }
 
-            let (len, src) = match socket.recv_from(&mut buf) {
+            let (mut len, src) = match socket.recv_from(&mut buf) {
                 Ok(v) => v,
                 Err(e) => {
                     // There are no more UDP packets to read, so end the read
@@ -143,6 +145,13 @@ fn events_loop(
                 }
             };
             debug!("got {} bytes from {:?}", len, src);
+
+            {
+                let mut b = [0; BENCHMARK_LEN];
+                b.copy_from_slice(&buf[(len - BENCHMARK_LEN)..len]);
+                info!("****** server benchmark: {} ms", elapsed(b)?.as_millis());
+                len -= BENCHMARK_LEN;
+            }
 
             let pkt_buf = &mut buf[..len];
             let hdr = match Header::from_slice(pkt_buf, MAX_CONN_ID_LEN) {
@@ -175,9 +184,11 @@ fn events_loop(
                     warn!("Doing version negotiation");
 
                     let len = quiche::negotiate_version(&hdr.scid, &hdr.dcid, &mut out).unwrap();
-                    let out = &out[..len];
+                    {
+                        out[len..(len + BENCHMARK_LEN)].copy_from_slice(&now()?);
+                    }
 
-                    while let Err(e) = socket.send_to(out, src) {
+                    while let Err(e) = socket.send_to(&out[..(len + BENCHMARK_LEN)], src) {
                         if e.kind() == IOErrorKind::WouldBlock {
                             debug!("send() would block");
                             continue;
@@ -313,7 +324,7 @@ fn events_loop(
         for mut r in clients.iter_mut() {
             let (_, client) = r.value_mut();
             loop {
-                let (written, send_info) = match client.conn.send(&mut out) {
+                let (mut written, send_info) = match client.conn.send(&mut out) {
                     Ok(v) => v,
 
                     Err(quiche::Error::Done) => {
@@ -328,6 +339,11 @@ fn events_loop(
                         break;
                     }
                 };
+
+                {
+                    out[written..(written + BENCHMARK_LEN)].copy_from_slice(&now()?);
+                    written += BENCHMARK_LEN;
+                }
 
                 while let Err(e) = socket.send_to(&out[..written], send_info.to) {
                     if e.kind() == IOErrorKind::WouldBlock {

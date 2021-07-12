@@ -5,7 +5,11 @@ use std::{
     time::Instant,
 };
 
-use crate::{tasks_number::TasksNumberGuard, MAX_DATAGRAM_SIZE, ONE_GB};
+use crate::{
+    benchmarks::{elapsed, now, BYTES_LEN as BENCHMARK_LEN},
+    tasks_number::TasksNumberGuard,
+    MAX_DATAGRAM_SIZE, ONE_GB,
+};
 use anyhow::{bail, Context};
 use log::{debug, error, info};
 use quiche::h3;
@@ -13,7 +17,7 @@ use rayon::ThreadPoolBuilder;
 use ring::rand::{SecureRandom, SystemRandom};
 const TASK_COUNT: usize = 1000;
 const WORKER_COUNT: usize = 10;
-const REQ_CNT_FOR_EACH_TASK: usize = 10;
+const REQ_CNT_FOR_EACH_TASK: usize = 1;
 const SERVER_NAME: &str = "up.qiniu.com";
 const UPLOAD_TOKEN: &str = "HwFOxpYCQU6oXoZXFOTh1mq5ZZig6Yyocgk3BTZZ:eJ4mCfwJjaQ_iycI2x6vk0qFiXA=:eyJkZWFkbGluZSI6MTY0OTIyNjI4NCwic2NvcGUiOiIyMDIwLTA2LWNoZWNrYmlsbHMifQ==";
 
@@ -35,10 +39,8 @@ pub(super) fn start_clients(
         sender: mio::unix::pipe::Sender,
     ) -> anyhow::Result<()> {
         let bind_addr = match server_address {
-            SocketAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 0),
-            SocketAddr::V6(_) => {
-                SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 0)), 0)
-            }
+            SocketAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            SocketAddr::V6(_) => SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0),
         };
         let sender = Arc::new(Mutex::new(sender));
 
@@ -91,8 +93,15 @@ fn start_client_worker(
     );
 
     let mut buf = [0; 65535];
-    let mut out = [0; MAX_DATAGRAM_SIZE];
-    let (written, send_info) = conn.send(&mut out).context("initial send failed")?;
+    let mut out = [0; MAX_DATAGRAM_SIZE + BENCHMARK_LEN];
+
+    let (mut written, send_info) = conn
+        .send(&mut out[..MAX_DATAGRAM_SIZE])
+        .context("initial send failed")?;
+    {
+        out[written..(written + BENCHMARK_LEN)].copy_from_slice(&now()?);
+        written += BENCHMARK_LEN;
+    }
 
     while let Err(err) = socket.send_to(&out[..written], send_info.to) {
         if err.kind() == IOErrorKind::WouldBlock {
@@ -136,7 +145,7 @@ fn start_client_worker(
                 break 'read;
             }
 
-            let (len, from_addr) = match socket.recv_from(&mut buf) {
+            let (mut len, from_addr) = match socket.recv_from(&mut buf) {
                 Ok(v) => v,
                 Err(e) => {
                     if e.kind() == IOErrorKind::WouldBlock {
@@ -147,6 +156,13 @@ fn start_client_worker(
                 }
             };
             debug!("[{}] got {} bytes", task_id, len);
+
+            {
+                let mut b = [0; BENCHMARK_LEN];
+                b.copy_from_slice(&buf[(len - BENCHMARK_LEN)..len]);
+                info!("****** client benchmark: {} ms", elapsed(b)?.as_millis());
+                len -= BENCHMARK_LEN;
+            }
 
             let read = match conn.recv(&mut buf[..len], quiche::RecvInfo { from: from_addr }) {
                 Ok(v) => v,
@@ -239,7 +255,7 @@ fn start_client_worker(
         }
 
         loop {
-            let (written, send_info) = match conn.send(&mut out) {
+            let (mut written, send_info) = match conn.send(&mut out) {
                 Ok(v) => v,
                 Err(quiche::Error::Done) => {
                     debug!("[{}] done writing", task_id);
@@ -251,6 +267,11 @@ fn start_client_worker(
                     break;
                 }
             };
+
+            {
+                out[written..(written + BENCHMARK_LEN)].copy_from_slice(&now()?);
+                written += BENCHMARK_LEN;
+            }
 
             while let Err(e) = socket.send_to(&out[..written], send_info.to) {
                 if e.kind() == IOErrorKind::WouldBlock {

@@ -1,8 +1,10 @@
+mod benchmarks;
 mod client;
 mod server;
 mod tasks_number;
 
 use client::{new_tasks_number, start_clients};
+use log::error;
 use server::start_server;
 
 use std::{
@@ -10,13 +12,13 @@ use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
     thread::Builder as ThreadBuilder,
 };
-const MAX_DATAGRAM_SIZE: usize = 1350;
+const MAX_DATAGRAM_SIZE: usize = 1200;
 const ONE_GB: u64 = 1 << 30;
 
 fn main() -> IOResult<()> {
     env_logger::builder().format_timestamp_micros().init();
 
-    let server_address = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 4433);
+    let server_address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4433);
     let server_socket = mio::net::UdpSocket::bind(server_address)?;
     let tasks_number = new_tasks_number();
     let (sender, receiver) = mio::unix::pipe::new()?;
@@ -42,7 +44,9 @@ fn main() -> IOResult<()> {
     });
 
     for thread in threads {
-        thread.join().unwrap();
+        if let Err(err) = thread.join() {
+            error!("Thread join error: {:?}", err);
+        }
     }
 
     Ok(())
